@@ -50,7 +50,13 @@ def get_connection():
 def init_db():
     """Initialize the database by creating all tables."""
     # Import all models to ensure they're registered with Base
-    from app.models.medicines import Medicine
+    from app.models.region import Region
+    from app.models.medical_center import MedicalCenter
+    from app.models.product_type import ProductType
+    from app.models.product import Product
+    from app.models.inventory import Inventory
+    from app.models.user import User
+    from app.models.search_history import SearchHistory
     
     Base.metadata.create_all(engine)
     logger.info("Database initialized")

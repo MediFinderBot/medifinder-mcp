@@ -24,7 +24,6 @@ def register_prompts(mcp: FastMCP):
     logger.info("MCP prompts registered")
 
 
-@mcp.prompt()
 def medicine_search_prompt(medicine_name: str) -> str:
     """Create a prompt for searching medicines by name.
     
@@ -51,7 +50,6 @@ If multiple medicines are found, list them in order of closest name match first.
 If no medicines are found, suggest alternative search terms."""
 
 
-@mcp.prompt()
 def medicine_availability_prompt(medicine_name: str, diresa: str = None) -> list[base.Message]:
     """Create a prompt for checking medicine availability.
     
@@ -81,7 +79,6 @@ If no locations are found with stock:
     ]
 
 
-@mcp.prompt()
 def medicine_statistics_prompt() -> str:
     """Create a prompt for analyzing medicine statistics.
     
@@ -100,7 +97,6 @@ Use the get_medicine_status tool to retrieve overall statistics, and then analyz
 Please provide your analysis in a clear, structured format with sections for each aspect mentioned above. Include recommendations for inventory management if appropriate."""
 
 
-@mcp.prompt()
 def regional_availability_prompt(diresa: str = None) -> list[base.Message]:
     """Create a prompt for analyzing regional medicine availability.
     

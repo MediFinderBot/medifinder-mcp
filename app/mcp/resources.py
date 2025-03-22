@@ -3,13 +3,18 @@ MCP resources for the MedifinderMCP Server.
 """
 import logging
 import json
-import pandas as pd
 from typing import Dict, Any
+from sqlalchemy import func
 
 from mcp.server.fastmcp import FastMCP, Context
 
 from app.db import queries
-from app.models.medicines import Medicine
+from app.db.connection import db_session
+from app.models.region import Region
+from app.models.medical_center import MedicalCenter
+from app.models.product_type import ProductType
+from app.models.product import Product
+from app.models.inventory import Inventory
 
 logger = logging.getLogger(__name__)
 
@@ -23,66 +28,98 @@ def register_resources(mcp: FastMCP):
     
     # Register all resources with the MCP server
     # Resource URI patterns
-    mcp.resource("medicine://{id}")(get_medicine_resource)
-    mcp.resource("stock://{name}")(get_medicine_stock_resource)
-    mcp.resource("locations://{diresa}")(get_locations_resource)
+    mcp.resource("product://{id}")(get_product_resource)
+    mcp.resource("stock://{name}")(get_product_stock_resource)
+    mcp.resource("locations://{region}")(get_locations_resource)
     mcp.resource("statistics://stock")(get_stock_statistics_resource)
     mcp.resource("statistics://regions")(get_regions_statistics_resource)
     
     logger.info("MCP resources registered")
 
 
-@mcp.resource("medicine://{id}")
-def get_medicine_resource(id: str) -> str:
-    """Get medicine details by ID.
+def get_product_resource(id: str) -> str:
+    """Get product details by ID.
     
     Args:
-        id: Medicine ID
+        id: Product ID
         
     Returns:
-        JSON string with medicine details
+        JSON string with product details
     """
-    logger.info(f"Fetching medicine resource for ID {id}")
+    logger.info(f"Fetching product resource for ID {id}")
     
     try:
-        medicine_id = int(id)
+        product_id = int(id)
     except ValueError:
-        return json.dumps({"error": f"Invalid medicine ID: {id}"})
+        return json.dumps({"error": f"Invalid product ID: {id}"})
     
-    medicine = queries.get_medicine_by_id(medicine_id)
+    product = queries.get_medicine_by_id(product_id)
     
-    if not medicine:
-        return json.dumps({"error": f"Medicine with ID {id} not found"})
+    if not product:
+        return json.dumps({"error": f"Product with ID {id} not found"})
     
-    return json.dumps(medicine.to_dict(), indent=2)
+    # Get inventory information for this product
+    with db_session() as session:
+        inventories = session.query(Inventory).filter(
+            Inventory.product_id == product_id
+        ).all()
+        
+        inventory_data = [inv.to_dict() for inv in inventories]
+    
+    result = product.to_dict()
+    result["inventories"] = inventory_data
+    
+    return json.dumps(result, indent=2)
 
 
-@mcp.resource("stock://{name}")
-def get_medicine_stock_resource(name: str) -> str:
-    """Get stock information for a medicine by name.
+def get_product_stock_resource(name: str) -> str:
+    """Get stock information for a product by name.
     
     Args:
-        name: Medicine name
+        name: Product name
         
     Returns:
         JSON string with stock information
     """
-    logger.info(f"Fetching stock information for medicine name '{name}'")
+    logger.info(f"Fetching stock information for product name '{name}'")
     
-    medicines = queries.search_medicines_by_name(name, limit=10)
+    products = queries.search_medicines_by_name(name, limit=10)
     
-    if not medicines:
-        return json.dumps({"error": f"No medicines found matching '{name}'"})
+    if not products:
+        return json.dumps({"error": f"No products found matching '{name}'"})
     
     results = []
-    for medicine in medicines:
-        # Calculate months of supply
-        months_of_supply = 0
-        if medicine.cpma and medicine.cpma > 0:
-            months_of_supply = medicine.stk / medicine.cpma
+    for product in products:
+        # Get inventory information for this product
+        with db_session() as session:
+            inventories = session.query(Inventory).filter(
+                Inventory.product_id == product.product_id
+            ).all()
+            
+            inventory_data = [inv.to_dict() for inv in inventories]
+            
+            # Calculate total stock across all locations
+            total_stock = sum(inv.current_stock for inv in inventories if inv.current_stock)
+            
+            # Calculate average monthly consumption
+            avg_consumption = sum(inv.avg_monthly_consumption for inv in inventories if inv.avg_monthly_consumption) / len(inventories) if inventories else 0
+            
+            # Calculate months of supply
+            months_of_supply = round(total_stock / avg_consumption, 2) if avg_consumption > 0 else 0
         
-        result = medicine.to_dict()
-        result["months_of_supply"] = round(months_of_supply, 2)
+        result = product.to_dict()
+        result["total_stock"] = total_stock
+        result["avg_monthly_consumption"] = round(avg_consumption, 2)
+        result["months_of_supply"] = months_of_supply
+        result["inventory_count"] = len(inventory_data)
+        result["inventory_summary"] = [
+            {
+                "center_id": inv["center_id"], 
+                "center_name": inv["center_name"],
+                "current_stock": inv["current_stock"],
+                "status_indicator": inv["status_indicator"]
+            } for inv in inventory_data[:5]  # Just show first 5 for summary
+        ]
         results.append(result)
     
     return json.dumps({
@@ -92,54 +129,44 @@ def get_medicine_stock_resource(name: str) -> str:
     }, indent=2)
 
 
-@mcp.resource("locations://{diresa}")
-def get_locations_resource(diresa: str) -> str:
-    """Get locations for a specific DIRESA (health region).
+def get_locations_resource(region: str) -> str:
+    """Get locations for a specific region.
     
     Args:
-        diresa: DIRESA name
+        region: Region name
         
     Returns:
         JSON string with location information
     """
-    logger.info(f"Fetching locations for DIRESA '{diresa}'")
+    logger.info(f"Fetching locations for region '{region}'")
     
-    with queries.db_session() as session:
-        # Get unique locations in this DIRESA
-        query = """
-            SELECT DISTINCT 
-                nombre_ejecutora, 
-                categoria,
-                reportante,
-                tipo_reportante
-            FROM medicines
-            WHERE diresa = :diresa
-            ORDER BY nombre_ejecutora
-        """
+    with db_session() as session:
+        # Get the region
+        db_region = session.query(Region).filter(
+            Region.name.ilike(f"%{region}%")
+        ).first()
         
-        locations = session.execute(query, {"diresa": diresa}).fetchall()
+        if not db_region:
+            return json.dumps({"error": f"No region found matching '{region}'"})
         
-        if not locations:
-            return json.dumps({"error": f"No locations found for DIRESA '{diresa}'"})
+        # Get medical centers in this region
+        centers = session.query(MedicalCenter).filter(
+            MedicalCenter.region_id == db_region.region_id
+        ).order_by(MedicalCenter.name).all()
         
-        # Format the locations
-        formatted_locations = []
-        for loc in locations:
-            formatted_locations.append({
-                "nombre_ejecutora": loc.nombre_ejecutora,
-                "categoria": loc.categoria,
-                "reportante": loc.reportante,
-                "tipo_reportante": loc.tipo_reportante
-            })
+        if not centers:
+            return json.dumps({"error": f"No medical centers found in region '{region}'"})
+        
+        # Format the centers
+        formatted_centers = [center.to_dict() for center in centers]
         
         return json.dumps({
-            "diresa": diresa,
-            "count": len(formatted_locations),
-            "locations": formatted_locations
+            "region": db_region.to_dict(),
+            "count": len(formatted_centers),
+            "centers": formatted_centers
         }, indent=2)
 
 
-@mcp.resource("statistics://stock")
 def get_stock_statistics_resource() -> str:
     """Get overall stock statistics.
     
@@ -154,7 +181,6 @@ def get_stock_statistics_resource() -> str:
     return json.dumps(stats, indent=2)
 
 
-@mcp.resource("statistics://regions")
 def get_regions_statistics_resource() -> str:
     """Get regional statistics.
     
@@ -166,22 +192,7 @@ def get_regions_statistics_resource() -> str:
     # Get regional statistics
     regional_stats = queries.get_stock_status_by_region()
     
-    # Format the results
-    formatted_stats = []
-    for stat in regional_stats:
-        # Convert SQLAlchemy Row to dictionary
-        stat_dict = dict(stat)
-        
-        # Calculate availability percentage
-        if stat_dict["total_medicines"] > 0:
-            availability = (stat_dict["available_medicines"] / stat_dict["total_medicines"]) * 100
-        else:
-            availability = 0
-            
-        stat_dict["availability_percentage"] = round(availability, 2)
-        formatted_stats.append(stat_dict)
-    
     return json.dumps({
-        "count": len(formatted_stats),
-        "regions": formatted_stats
+        "count": len(regional_stats),
+        "regions": regional_stats
     }, indent=2)

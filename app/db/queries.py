@@ -2,15 +2,22 @@
 Database queries for the MedifinderMCP Server.
 """
 import logging
-from sqlalchemy import text, func
+from sqlalchemy import func, or_
+
 from app.db.connection import db_session
-from app.models.medicines import Medicine
-from app.config import MAX_SEARCH_RESULTS, SEARCH_SIMILARITY_THRESHOLD
+from app.models.region import Region
+from app.models.medical_center import MedicalCenter
+from app.models.product_type import ProductType
+from app.models.product import Product
+from app.models.inventory import Inventory
+from app.models.user import User
+from app.models.search_history import SearchHistory
+from app.config import MAX_SEARCH_RESULTS
 
 logger = logging.getLogger(__name__)
 
 def search_medicines_by_name(name, limit=MAX_SEARCH_RESULTS):
-    """Search for medicines by name using fuzzy matching.
+    """Search for medicines by name using LIKE matching.
     
     Args:
         name (str): The medicine name to search for
@@ -20,14 +27,14 @@ def search_medicines_by_name(name, limit=MAX_SEARCH_RESULTS):
         list: List of matching medicines
     """
     with db_session() as session:
-        # Use PostgreSQL's trigram similarity for fuzzy matching
-        query = session.query(Medicine).filter(
-            func.similarity(Medicine.nombre_prod, name) > SEARCH_SIMILARITY_THRESHOLD
-        ).order_by(
-            func.similarity(Medicine.nombre_prod, name).desc()
+        search_term = f"%{name}%"
+        query = session.query(Product).filter(
+            Product.name.ilike(search_term)
         ).limit(limit)
         
-        return query.all()
+        # Fetch all results within this session and convert to dictionaries
+        results = [product.to_dict() for product in query.all()]
+        return results
 
 def search_medicines_by_location(diresa, categoria=None, limit=MAX_SEARCH_RESULTS):
     """Search for medicines by location.
@@ -38,15 +45,33 @@ def search_medicines_by_location(diresa, categoria=None, limit=MAX_SEARCH_RESULT
         limit (int): Maximum number of results to return
         
     Returns:
-        list: List of matching medicines
+        list: List of matching medicines with inventory
     """
     with db_session() as session:
-        query = session.query(Medicine).filter(Medicine.diresa == diresa)
+        # Join Product, Inventory, MedicalCenter, and Region
+        query = session.query(Product, Inventory).join(
+            Inventory, Product.product_id == Inventory.product_id
+        ).join(
+            MedicalCenter, Inventory.center_id == MedicalCenter.center_id
+        ).join(
+            Region, MedicalCenter.region_id == Region.region_id
+        ).filter(
+            Region.name.ilike(f"%{diresa}%")
+        )
         
         if categoria:
-            query = query.filter(Medicine.categoria == categoria)
+            query = query.filter(MedicalCenter.category.ilike(f"%{categoria}%"))
             
-        return query.limit(limit).all()
+        query = query.limit(limit)
+        
+        # Process results
+        results = []
+        for product, inventory in query.all():
+            product_dict = product.to_dict()
+            product_dict["inventory"] = inventory.to_dict()
+            results.append(product_dict)
+            
+        return results
 
 def get_medicine_by_id(medicine_id):
     """Get a medicine by its ID.
@@ -55,10 +80,10 @@ def get_medicine_by_id(medicine_id):
         medicine_id (int): The medicine ID
         
     Returns:
-        Medicine: The medicine object or None if not found
+        Product: The product object or None if not found
     """
     with db_session() as session:
-        return session.query(Medicine).filter(Medicine.id == medicine_id).first()
+        return session.query(Product).filter(Product.product_id == medicine_id).first()
 
 def get_available_medicine_locations(medicine_name, min_stock=1):
     """Get locations where a medicine is available with stock.
@@ -68,21 +93,40 @@ def get_available_medicine_locations(medicine_name, min_stock=1):
         min_stock (int): Minimum stock required to consider available
         
     Returns:
-        list: List of locations with available stock
+        list: List of dictionaries with location information
     """
     with db_session() as session:
-        query = session.query(
-            Medicine.diresa,
-            Medicine.categoria,
-            Medicine.nombre_ejecutora,
-            Medicine.reportante,
-            Medicine.stk
-        ).filter(
-            func.lower(Medicine.nombre_prod).contains(func.lower(medicine_name)),
-            Medicine.stk >= min_stock
-        ).order_by(Medicine.stk.desc())
+        search_term = f"%{medicine_name}%"
         
-        return query.all()
+        query = session.query(
+            Region.name.label('region'),
+            MedicalCenter.category,
+            MedicalCenter.name.label('center_name'),
+            MedicalCenter.reporter_name,
+            Inventory.current_stock.label('stock')
+        ).select_from(Product).join(
+            Inventory, Product.product_id == Inventory.product_id
+        ).join(
+            MedicalCenter, Inventory.center_id == MedicalCenter.center_id
+        ).join(
+            Region, MedicalCenter.region_id == Region.region_id
+        ).filter(
+            Product.name.ilike(search_term),
+            Inventory.current_stock >= min_stock
+        ).order_by(Inventory.current_stock.desc())
+        
+        # Convert results to dictionaries immediately
+        results = []
+        for row in query.all():
+            results.append({
+                "region": row.region,
+                "category": row.category,
+                "center_name": row.center_name,
+                "reporter_name": row.reporter_name,
+                "stock": row.stock
+            })
+        
+        return results
 
 def get_stock_status_by_region():
     """Get aggregate stock status by region.
@@ -91,21 +135,65 @@ def get_stock_status_by_region():
         list: List of regions with their stock status
     """
     with db_session() as session:
-        query = text("""
-            SELECT 
-                diresa, 
-                COUNT(*) as total_medicines,
-                SUM(CASE WHEN stk > 0 THEN 1 ELSE 0 END) as available_medicines,
-                SUM(CASE WHEN indicador = 'Sobrestock' THEN 1 ELSE 0 END) as overstock,
-                SUM(CASE WHEN indicador = 'Substock' THEN 1 ELSE 0 END) as understock,
-                SUM(CASE WHEN indicador = 'Normostock' THEN 1 ELSE 0 END) as normalstock,
-                SUM(CASE WHEN indicador = 'Desabastecido' THEN 1 ELSE 0 END) as outofstock
-            FROM medicines
-            GROUP BY diresa
-            ORDER BY diresa
-        """)
+        regions = session.query(Region).all()
+        results = []
         
-        return session.execute(query).fetchall()
+        for region in regions:
+            # Count total products in inventory for this region
+            total_count = session.query(func.count(Inventory.inventory_id)).join(
+                MedicalCenter, Inventory.center_id == MedicalCenter.center_id
+            ).filter(
+                MedicalCenter.region_id == region.region_id
+            ).scalar()
+            
+            # Count available products (stock > 0)
+            available_count = session.query(func.count(Inventory.inventory_id)).join(
+                MedicalCenter, Inventory.center_id == MedicalCenter.center_id
+            ).filter(
+                MedicalCenter.region_id == region.region_id,
+                Inventory.current_stock > 0
+            ).scalar()
+            
+            # Count by indicator
+            overstock = session.query(func.count(Inventory.inventory_id)).join(
+                MedicalCenter, Inventory.center_id == MedicalCenter.center_id
+            ).filter(
+                MedicalCenter.region_id == region.region_id,
+                Inventory.status_indicator == 'Sobrestock'
+            ).scalar()
+            
+            understock = session.query(func.count(Inventory.inventory_id)).join(
+                MedicalCenter, Inventory.center_id == MedicalCenter.center_id
+            ).filter(
+                MedicalCenter.region_id == region.region_id,
+                Inventory.status_indicator == 'Substock'
+            ).scalar()
+            
+            normalstock = session.query(func.count(Inventory.inventory_id)).join(
+                MedicalCenter, Inventory.center_id == MedicalCenter.center_id
+            ).filter(
+                MedicalCenter.region_id == region.region_id,
+                Inventory.status_indicator == 'Normostock'
+            ).scalar()
+            
+            outofstock = session.query(func.count(Inventory.inventory_id)).join(
+                MedicalCenter, Inventory.center_id == MedicalCenter.center_id
+            ).filter(
+                MedicalCenter.region_id == region.region_id,
+                Inventory.status_indicator == 'Desabastecido'
+            ).scalar()
+            
+            results.append({
+                "region": region.name,
+                "total_medicines": total_count,
+                "available_medicines": available_count,
+                "overstock": overstock,
+                "understock": understock,
+                "normalstock": normalstock,
+                "outofstock": outofstock
+            })
+        
+        return results
 
 def get_medicine_statistics():
     """Get overall medicine statistics.
@@ -114,17 +202,117 @@ def get_medicine_statistics():
         dict: Statistics about medicines in the database
     """
     with db_session() as session:
-        total_count = session.query(func.count(Medicine.id)).scalar()
-        available_count = session.query(func.count(Medicine.id)).filter(Medicine.stk > 0).scalar()
-        overstock_count = session.query(func.count(Medicine.id)).filter(Medicine.indicador == 'Sobrestock').scalar()
-        understock_count = session.query(func.count(Medicine.id)).filter(Medicine.indicador == 'Substock').scalar()
-        outofstock_count = session.query(func.count(Medicine.id)).filter(Medicine.indicador == 'Desabastecido').scalar()
+        total_count = session.query(func.count(Inventory.inventory_id)).scalar()
+        available_count = session.query(func.count(Inventory.inventory_id)).filter(
+            Inventory.current_stock > 0
+        ).scalar()
+        
+        overstock_count = session.query(func.count(Inventory.inventory_id)).filter(
+            Inventory.status_indicator == 'Sobrestock'
+        ).scalar()
+        
+        understock_count = session.query(func.count(Inventory.inventory_id)).filter(
+            Inventory.status_indicator == 'Substock'
+        ).scalar()
+        
+        outofstock_count = session.query(func.count(Inventory.inventory_id)).filter(
+            Inventory.status_indicator == 'Desabastecido'
+        ).scalar()
+        
+        normalstock_count = session.query(func.count(Inventory.inventory_id)).filter(
+            Inventory.status_indicator == 'Normostock'
+        ).scalar()
+        
+        # Count unique products
+        unique_products = session.query(func.count(func.distinct(Product.product_id))).scalar()
+        
+        # Count unique medical centers
+        unique_centers = session.query(func.count(func.distinct(MedicalCenter.center_id))).scalar()
+        
+        # Count unique regions
+        unique_regions = session.query(func.count(func.distinct(Region.region_id))).scalar()
         
         return {
-            "total": total_count,
-            "available": available_count,
+            "total_inventory_records": total_count,
+            "available_inventory": available_count,
             "overstock": overstock_count,
             "understock": understock_count,
+            "normalstock": normalstock_count,
             "outofstock": outofstock_count,
+            "unique_products": unique_products,
+            "unique_medical_centers": unique_centers,
+            "unique_regions": unique_regions,
             "availability_rate": round(available_count / total_count * 100, 2) if total_count > 0 else 0
         }
+
+def diagnose_database():
+    """Get diagnostic information about the database.
+    
+    Returns:
+        dict: Diagnostic information about database tables and content
+    """
+    from app.db.connection import engine
+    
+    with db_session() as session:
+        result = {
+            "tables": {},
+            "sample_data": {},
+            "connection_url": str(engine.url).replace(":password@", ":******@"),
+        }
+        
+        # Count records in each table
+        try:
+            result["tables"]["regions"] = session.query(func.count(Region.region_id)).scalar()
+        except Exception as e:
+            result["tables"]["regions"] = f"Error: {str(e)}"
+            
+        try:
+            result["tables"]["medical_centers"] = session.query(func.count(MedicalCenter.center_id)).scalar()
+        except Exception as e:
+            result["tables"]["medical_centers"] = f"Error: {str(e)}"
+            
+        try:
+            result["tables"]["product_types"] = session.query(func.count(ProductType.type_id)).scalar()
+        except Exception as e:
+            result["tables"]["product_types"] = f"Error: {str(e)}"
+            
+        try:
+            result["tables"]["products"] = session.query(func.count(Product.product_id)).scalar()
+        except Exception as e:
+            result["tables"]["products"] = f"Error: {str(e)}"
+            
+        try:
+            result["tables"]["inventory"] = session.query(func.count(Inventory.inventory_id)).scalar()
+        except Exception as e:
+            result["tables"]["inventory"] = f"Error: {str(e)}"
+        
+        # Get sample data if available
+        if result["tables"]["products"] and not isinstance(result["tables"]["products"], str) and result["tables"]["products"] > 0:
+            try:
+                sample_product = session.query(Product).first()
+                result["sample_data"]["product"] = sample_product.to_dict() if sample_product else None
+            except Exception as e:
+                result["sample_data"]["product"] = f"Error: {str(e)}"
+            
+        if result["tables"]["regions"] and not isinstance(result["tables"]["regions"], str) and result["tables"]["regions"] > 0:
+            try:
+                sample_region = session.query(Region).first()
+                result["sample_data"]["region"] = sample_region.to_dict() if sample_region else None
+            except Exception as e:
+                result["sample_data"]["region"] = f"Error: {str(e)}"
+            
+        if result["tables"]["inventory"] and not isinstance(result["tables"]["inventory"], str) and result["tables"]["inventory"] > 0:
+            try:
+                sample_inventory = session.query(Inventory).first()
+                result["sample_data"]["inventory"] = sample_inventory.to_dict() if sample_inventory else None
+            except Exception as e:
+                result["sample_data"]["inventory"] = f"Error: {str(e)}"
+        
+        # Also try a simple raw SQL query to check if database is actually accessible
+        try:
+            from sqlalchemy import text
+            result["raw_sql_test"] = bool(session.execute(text("SELECT 1")).scalar())
+        except Exception as e:
+            result["raw_sql_test"] = f"Error: {str(e)}"
+        
+        return result
